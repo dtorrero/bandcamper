@@ -15,6 +15,7 @@ from requests import HTTPError
 
 from bandcamper.metadata.utils import get_track_output_context
 from bandcamper.metadata.utils import suffix_to_metadata
+from bandcamper.metadata.bandcamp_writer import BandcampMetadataWriter
 from bandcamper.requests.requester import Requester
 from bandcamper.screamo import Screamer
 from bandcamper.utils import FilenameFormatter
@@ -78,6 +79,7 @@ class Bandcamper:
         self.formatter = FilenameFormatter()
         self.screamer = screamer or Screamer()
         self.requester = requester or Requester()
+        self.metadata_writer = BandcampMetadataWriter()
         for url in urls:
             self.add_url(url)
 
@@ -355,13 +357,18 @@ class Bandcamper:
             "artist": artist,
             "album": album,
             "year": year,
+            "bandcamp_url": url,
         }
+        # Track all moved files for metadata writing
+        moved_files = []
+        
         for file_path in file_paths:
             if file_path.is_dir():
                 for track_path in file_path.iterdir():
                     new_path = self.move_file(
                         track_path, destination, output, output_extra, tracks, context
                     )
+                    moved_files.append(new_path)
                     self.screamer.success(
                         f"New file: {new_path}", verbose=True, short_symbol=True
                     )
@@ -373,7 +380,46 @@ class Bandcamper:
                 new_path = self.move_file(
                     file_path, destination, output, output_extra, tracks, context
                 )
+                moved_files.append(new_path)
                 self.screamer.success(f"New file: {new_path}", short_symbol=True)
+        
+        # Write metadata to all moved audio files
+        self._write_metadata_to_files(moved_files, context.get("bandcamp_url"))
+
+    def _write_metadata_to_files(self, file_paths, bandcamp_url):
+        """Write Bandcamp metadata to audio files.
+        
+        Args:
+            file_paths: List of Path objects for audio files
+            bandcamp_url: Original Bandcamp URL for metadata extraction
+        """
+        if not bandcamp_url:
+            self.screamer.info("No Bandcamp URL available for metadata writing", verbose=True)
+            return
+        
+        audio_files = []
+        for file_path in file_paths:
+            if file_path.suffix in suffix_to_metadata:
+                audio_files.append(file_path)
+        
+        if not audio_files:
+            self.screamer.info("No supported audio files found for metadata writing", verbose=True)
+            return
+        
+        self.screamer.info(f"Writing metadata from {bandcamp_url} to {len(audio_files)} audio file(s)")
+        
+        success_count = 0
+        for file_path in audio_files:
+            try:
+                if self.metadata_writer.write_metadata_to_file(file_path, bandcamp_url):
+                    success_count += 1
+            except Exception as e:
+                self.screamer.error(f"Error writing metadata to {file_path}: {e}", verbose=True)
+        
+        if success_count > 0:
+            self.screamer.success(f"Successfully wrote metadata to {success_count}/{len(audio_files)} audio files")
+        else:
+            self.screamer.error("Failed to write metadata to any audio files")
 
     def download_all(self, destination, output, output_extra, *download_formats):
         for url in self.urls:

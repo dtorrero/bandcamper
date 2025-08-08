@@ -2,6 +2,7 @@ from mimetypes import guess_type
 
 from mutagen.id3 import APIC
 from mutagen.id3 import TALB
+from mutagen.id3 import TDRC
 from mutagen.id3 import TIT2
 from mutagen.id3 import TPE1
 from mutagen.id3 import TPE2
@@ -19,6 +20,7 @@ class MP3Metadata(TrackMetadata):
     ALBUM_TAG = "TALB"
     ARTIST_TAG = "TPE1"
     ALBUM_ARTIST_TAG = "TPE2"
+    YEAR_TAG = "TDRC"
     LYRICS_TAG = "USLT"
     COVER_ART_TAG = "APIC:cover"
 
@@ -99,6 +101,16 @@ class MP3Metadata(TrackMetadata):
         if self.ALBUM_ARTIST_TAG not in self.file:
             self.file[self.ALBUM_ARTIST_TAG] = TPE2()
         self.file[self.ALBUM_ARTIST_TAG].text = val
+
+    @property
+    def year(self):
+        return self.file.get(self.YEAR_TAG, [None])[0]
+
+    @year.setter
+    def year(self, val):
+        if self.YEAR_TAG not in self.file:
+            self.file[self.YEAR_TAG] = TDRC()
+        self.file[self.YEAR_TAG].text = str(val)
 
     @property
     def lyrics(self):
