@@ -15,6 +15,7 @@ from requests import HTTPError
 
 from bandcamper.metadata.utils import get_track_output_context
 from bandcamper.metadata.utils import suffix_to_metadata
+from bandcamper.metadata.bandcamp_writer import BandcampMetadataWriter
 from bandcamper.requests.requester import Requester
 from bandcamper.screamo import Screamer
 from bandcamper.utils import FilenameFormatter
@@ -78,6 +79,7 @@ class Bandcamper:
         self.formatter = FilenameFormatter()
         self.screamer = screamer or Screamer()
         self.requester = requester or Requester()
+        self.metadata_writer = BandcampMetadataWriter()
         for url in urls:
             self.add_url(url)
 
@@ -235,7 +237,44 @@ class Bandcamper:
     def _sanitize_file_path(self, file_path):
         platform = platform_system()
         platform = self.PLATFORMS.get(platform, platform)
-        return sanitize_filepath(file_path, platform=platform)
+        
+        # Convert Path object to string for processing
+        file_path_str = str(file_path)
+        
+        # CRITICAL: We must handle slash replacement BEFORE creating any Path objects
+        # because Path objects automatically split on slashes, truncating song titles
+        
+        import re
+        
+        # Audio file extensions we support
+        audio_extensions = r'\.(mp3|flac|wav|m4a|aiff|ogg)$'
+        
+        # Strategy: Find the rightmost slash that is followed by a string ending with an audio extension
+        # This identifies the boundary between directory path and filename
+        
+        # Use regex to find the last occurrence of a slash followed by text ending with audio extension
+        pattern = r'(.*/)(.*' + audio_extensions + r')'
+        match = re.search(pattern, file_path_str, re.IGNORECASE)
+        
+        if match:
+            # We found a directory/filename split
+            directory_part = match.group(1)[:-1]  # Remove the trailing slash
+            filename_part = match.group(2)
+            
+            # Replace slashes in the filename part only
+            sanitized_filename = filename_part.replace('/', '-')
+            
+            # Reconstruct the path
+            if directory_part:
+                sanitized_path = directory_part + '/' + sanitized_filename
+            else:
+                sanitized_path = sanitized_filename
+        else:
+            # No clear directory/filename split found, treat as pure filename
+            sanitized_path = file_path_str.replace('/', '-')
+        
+        # Now we can safely use sanitize_filepath and create Path object
+        return Path(sanitize_filepath(sanitized_path, platform=platform))
 
     def move_file(self, file_path, destination, output, output_extra, tracks, context):
         if file_path.suffix in suffix_to_metadata:
@@ -243,9 +282,20 @@ class Bandcamper:
         else:
             output = output_extra
             context["filename"] = file_path.name
-        move_to = self._sanitize_file_path(
-            destination / self.formatter.format(output, **context)
-        )
+        
+        # CRITICAL: Replace slashes in context values BEFORE formatting
+        # This preserves directory structure while fixing slashes in song titles
+        sanitized_context = context.copy()
+        for key, value in sanitized_context.items():
+            if isinstance(value, str) and '/' in value:
+                sanitized_context[key] = value.replace('/', '-')
+        
+        # Format the filename with sanitized context
+        formatted_filename = self.formatter.format(output, **sanitized_context)
+        
+        # Now safely create the path (slashes in template remain as directory separators)
+        move_to = self._sanitize_file_path(destination / formatted_filename)
+        
         move_to.parent.mkdir(parents=True, exist_ok=True)
         file_path.replace(move_to)
         return move_to
@@ -355,13 +405,18 @@ class Bandcamper:
             "artist": artist,
             "album": album,
             "year": year,
+            "bandcamp_url": url,
         }
+        # Track all moved files for metadata writing
+        moved_files = []
+        
         for file_path in file_paths:
             if file_path.is_dir():
                 for track_path in file_path.iterdir():
                     new_path = self.move_file(
                         track_path, destination, output, output_extra, tracks, context
                     )
+                    moved_files.append(new_path)
                     self.screamer.success(
                         f"New file: {new_path}", verbose=True, short_symbol=True
                     )
@@ -373,7 +428,82 @@ class Bandcamper:
                 new_path = self.move_file(
                     file_path, destination, output, output_extra, tracks, context
                 )
+                moved_files.append(new_path)
                 self.screamer.success(f"New file: {new_path}", short_symbol=True)
+        
+        # Write metadata to all moved audio files
+        self._write_metadata_to_files(moved_files, context.get("bandcamp_url"))
+        
+        # Download cover image
+        self._download_cover_image(music_data.get("art_url"), moved_files)
+
+    def _write_metadata_to_files(self, file_paths, bandcamp_url):
+        """Write Bandcamp metadata to audio files.
+        
+        Args:
+            file_paths: List of Path objects for audio files
+            bandcamp_url: Original Bandcamp URL for metadata extraction
+        """
+        if not bandcamp_url:
+            self.screamer.info("No Bandcamp URL available for metadata writing", verbose=True)
+            return
+        
+        audio_files = []
+        for file_path in file_paths:
+            if file_path.suffix in suffix_to_metadata:
+                audio_files.append(file_path)
+        
+        if not audio_files:
+            self.screamer.info("No supported audio files found for metadata writing", verbose=True)
+            return
+        
+        self.screamer.info(f"Writing metadata from {bandcamp_url} to {len(audio_files)} audio file(s)")
+        
+        success_count = 0
+        for file_path in audio_files:
+            try:
+                if self.metadata_writer.write_metadata_to_file(file_path, bandcamp_url):
+                    success_count += 1
+            except Exception as e:
+                self.screamer.error(f"Error writing metadata to {file_path}: {e}", verbose=True)
+        
+        if success_count > 0:
+            self.screamer.success(f"Successfully wrote metadata to {success_count}/{len(audio_files)} audio files")
+        else:
+            self.screamer.error("Failed to write metadata to any audio files")
+
+    def _download_cover_image(self, art_url, moved_files):
+        """Download cover image to the album directory.
+        
+        Args:
+            art_url: URL of the cover art image
+            moved_files: List of moved audio files to determine album directory
+        """
+        if not art_url or not moved_files:
+            return
+        
+        # Get the album directory from the first moved file
+        album_dir = moved_files[0].parent
+        cover_path = album_dir / "cover.png"
+        
+        # Skip if cover already exists
+        if cover_path.exists():
+            self.screamer.info(f"Cover image already exists: {cover_path}", verbose=True)
+            return
+        
+        try:
+            self.screamer.info(f"Downloading cover image from {art_url}")
+            response = self.requester.session.get(art_url)
+            response.raise_for_status()
+            
+            # Write the image data to cover.png
+            with open(cover_path, 'wb') as f:
+                f.write(response.content)
+            
+            self.screamer.success(f"Cover image saved: {cover_path}")
+            
+        except Exception as e:
+            self.screamer.error(f"Failed to download cover image: {e}", verbose=True)
 
     def download_all(self, destination, output, output_extra, *download_formats):
         for url in self.urls:
