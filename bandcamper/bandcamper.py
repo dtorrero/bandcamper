@@ -237,7 +237,44 @@ class Bandcamper:
     def _sanitize_file_path(self, file_path):
         platform = platform_system()
         platform = self.PLATFORMS.get(platform, platform)
-        return sanitize_filepath(file_path, platform=platform)
+        
+        # Convert Path object to string for processing
+        file_path_str = str(file_path)
+        
+        # CRITICAL: We must handle slash replacement BEFORE creating any Path objects
+        # because Path objects automatically split on slashes, truncating song titles
+        
+        import re
+        
+        # Audio file extensions we support
+        audio_extensions = r'\.(mp3|flac|wav|m4a|aiff|ogg)$'
+        
+        # Strategy: Find the rightmost slash that is followed by a string ending with an audio extension
+        # This identifies the boundary between directory path and filename
+        
+        # Use regex to find the last occurrence of a slash followed by text ending with audio extension
+        pattern = r'(.*/)(.*' + audio_extensions + r')'
+        match = re.search(pattern, file_path_str, re.IGNORECASE)
+        
+        if match:
+            # We found a directory/filename split
+            directory_part = match.group(1)[:-1]  # Remove the trailing slash
+            filename_part = match.group(2)
+            
+            # Replace slashes in the filename part only
+            sanitized_filename = filename_part.replace('/', '-')
+            
+            # Reconstruct the path
+            if directory_part:
+                sanitized_path = directory_part + '/' + sanitized_filename
+            else:
+                sanitized_path = sanitized_filename
+        else:
+            # No clear directory/filename split found, treat as pure filename
+            sanitized_path = file_path_str.replace('/', '-')
+        
+        # Now we can safely use sanitize_filepath and create Path object
+        return Path(sanitize_filepath(sanitized_path, platform=platform))
 
     def move_file(self, file_path, destination, output, output_extra, tracks, context):
         if file_path.suffix in suffix_to_metadata:
@@ -245,9 +282,20 @@ class Bandcamper:
         else:
             output = output_extra
             context["filename"] = file_path.name
-        move_to = self._sanitize_file_path(
-            destination / self.formatter.format(output, **context)
-        )
+        
+        # CRITICAL: Replace slashes in context values BEFORE formatting
+        # This preserves directory structure while fixing slashes in song titles
+        sanitized_context = context.copy()
+        for key, value in sanitized_context.items():
+            if isinstance(value, str) and '/' in value:
+                sanitized_context[key] = value.replace('/', '-')
+        
+        # Format the filename with sanitized context
+        formatted_filename = self.formatter.format(output, **sanitized_context)
+        
+        # Now safely create the path (slashes in template remain as directory separators)
+        move_to = self._sanitize_file_path(destination / formatted_filename)
+        
         move_to.parent.mkdir(parents=True, exist_ok=True)
         file_path.replace(move_to)
         return move_to
