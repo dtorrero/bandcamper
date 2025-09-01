@@ -433,6 +433,9 @@ class Bandcamper:
         
         # Write metadata to all moved audio files
         self._write_metadata_to_files(moved_files, context.get("bandcamp_url"))
+        
+        # Download cover image
+        self._download_cover_image(music_data.get("art_url"), moved_files)
 
     def _write_metadata_to_files(self, file_paths, bandcamp_url):
         """Write Bandcamp metadata to audio files.
@@ -468,6 +471,39 @@ class Bandcamper:
             self.screamer.success(f"Successfully wrote metadata to {success_count}/{len(audio_files)} audio files")
         else:
             self.screamer.error("Failed to write metadata to any audio files")
+
+    def _download_cover_image(self, art_url, moved_files):
+        """Download cover image to the album directory.
+        
+        Args:
+            art_url: URL of the cover art image
+            moved_files: List of moved audio files to determine album directory
+        """
+        if not art_url or not moved_files:
+            return
+        
+        # Get the album directory from the first moved file
+        album_dir = moved_files[0].parent
+        cover_path = album_dir / "cover.png"
+        
+        # Skip if cover already exists
+        if cover_path.exists():
+            self.screamer.info(f"Cover image already exists: {cover_path}", verbose=True)
+            return
+        
+        try:
+            self.screamer.info(f"Downloading cover image from {art_url}")
+            response = self.requester.session.get(art_url)
+            response.raise_for_status()
+            
+            # Write the image data to cover.png
+            with open(cover_path, 'wb') as f:
+                f.write(response.content)
+            
+            self.screamer.success(f"Cover image saved: {cover_path}")
+            
+        except Exception as e:
+            self.screamer.error(f"Failed to download cover image: {e}", verbose=True)
 
     def download_all(self, destination, output, output_extra, *download_formats):
         for url in self.urls:
